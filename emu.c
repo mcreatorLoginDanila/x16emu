@@ -112,7 +112,6 @@ void RunCPU(CPU* cpu) {
                 }
                 if (jmp) cpu->ip += offset;
             }
-
             else if (op >= 0x80 && op <= 0x83) {
                 BYTE modrm = Fetch8(cpu); int is_16_bit = (op == 0x81 || op == 0x83);
                 DecodeModRM(cpu, modrm, is_16_bit, &pRM, &pReg);
@@ -120,6 +119,13 @@ void RunCPU(CPU* cpu) {
                 DWORD s = (op == 0x81) ? Fetch16(cpu) : (char)Fetch8(cpu), d = is_16_bit ? *(WORD*)pRM : *(BYTE*)pRM;
                 DWORD res = DoALU(cpu, alu_op, d, s, is_16_bit);
                 if (alu_op != 7) { if (is_16_bit) *(WORD*)pRM = (WORD)res; else *(BYTE*)pRM = (BYTE)res;}
+            }
+            else if (op == 0x84 || op == 0x85) {
+                BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
+                DoALU(cpu, 4, is16 ? *(WORD*)pRM : *(BYTE*)pRM, is16 ? *(WORD*)pReg : *(BYTE*)pReg, is16);
+            }
+            else if (op == 0xA8 || op == 0xA9) {
+                DoALU(cpu, 4, is16 ? cpu->ax : cpu->al, is16 ? Fetch16(cpu) : Fetch8(cpu), is16);
             }
             else if (op >= 0x88 && op <= 0x8B) {
                 BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
@@ -131,17 +137,35 @@ void RunCPU(CPU* cpu) {
                 int sreg = (modrm >> 3) & 3;
                 if (op == 0x8E) *sReg[sreg] = *(WORD*)pRM; else *(WORD*)pRM = *sReg[sreg];
             }
-
+            else if (op == 0x8D) {
+                BYTE modrm = Fetch8(cpu); BYTE mod = (modrm >> 6) & 3; BYTE rm = modrm & 7;
+                if (mod != 3) {
+                    WORD off = 0;
+                    switch (rm) {
+                    case 0: off = cpu->bx + cpu->si; break; case 1: off = cpu->bx + cpu->di; break;
+                    case 2: off = cpu->bp + cpu->si; break; case 3: off = cpu->bp + cpu->di; break;
+                    case 4: off = cpu->si; break; case 5: off = cpu->di; break;
+                    case 6: off = cpu->bp; break; case 7: off = cpu->bx; break;
+                    }
+                    if (mod == 1) off += (char)Fetch8(cpu); else if (mod == 2) off += Fetch16(cpu);
+                    else if (mod == 0 && rm == 6) off = Fetch16(cpu);
+                    *r16[(modrm >> 3) & 7] = off;
+                }
+            }
+            else if (op >= 0x90 && op <= 0x97) {
+                int reg = op & 7; WORD temp = cpu->ax;
+                cpu->ax = *r16[reg]; *r16[reg] = temp;
+            }
+            else if (op == 0x98) cpu->ax = (short)((char)cpu->al);
+            else if (op == 0x99) cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000;
             else if (op == 0x9A) {WORD o = Fetch16(cpu), s = Fetch16(cpu); Push(cpu, cpu->cs); Push(cpu, cpu->ip); cpu->cs = s; cpu->ip = o;}
             else if (op == 0xEA) {WORD o = Fetch16(cpu), s = Fetch16(cpu); cpu->cs = s; cpu->ip = o;}
             else if (op == 0xCB) {cpu->ip = Pop(cpu); cpu->cs = Pop(cpu);}
-
             else if (op >= 0xA0 && op <= 0xA3) {
                 WORD addr = Fetch16(cpu);
                 if (op == 0xA0) cpu->al = memory[PHYS(cpu->ds, addr)]; else if (op == 0xA1) cpu->ax = *(WORD*)&memory[PHYS(cpu->ds, addr)];
                 else if (op == 0xA2) memory[PHYS(cpu->ds, addr)] = cpu->al; else if (op == 0xA3) *(WORD*)&memory[PHYS(cpu->ds, addr)] = cpu->ax;
             }
-
             else if (op >= 0xA4 && op <= 0xAD) {
                 int step = is16 ? 2 : 1; if (cpu->fD) step = -step;
                 do {
@@ -166,25 +190,33 @@ void RunCPU(CPU* cpu) {
                     if (rep) { cpu->cx--; if (op >= 0xA6 && op <= 0xA7 && (!cpu->cx || !cpu->fZ)) rep = FALSE;}
                 } while (rep && cpu->cx > 0);
             }
-
+            else if (op == 0xAE || op == 0xAF) {
+                int step = is16 ? 2 : 1; if (cpu->fD) step = -step;
+                do {
+                    DWORD d_v = is16 ? *(WORD*)&memory[PHYS(cpu->es, cpu->di)] : memory[PHYS(cpu->es, cpu->di)];
+                    DWORD s_v = is16 ? cpu->ax : cpu->al;
+                    DoALU(cpu, 7, s_v, d_v, is16);
+                    cpu->di += step;
+                    if (rep) {cpu->cx--; if (!cpu->cx) rep = FALSE;}
+                }
+                while (rep && cpu->cx > 0);
+            }
             else if (op >= 0xB0 && op <= 0xB7) *r8[op & 7] = Fetch8(cpu);
             else if (op >= 0xB8 && op <= 0xBF) *r16[op & 7] = Fetch16(cpu);
-
             else if (op >= 0xD0 && op <= 0xD3) {
                 BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
                 int sub = (modrm >> 3) & 7; int count = (op >= 0xD2) ? cpu->cl : 1;
                 DWORD val = is16 ? *(WORD*)pRM : *(BYTE*)pRM; int bits = is16 ? 16 : 8;
                 while (count--) {
-                    if (sub == 0) { cpu->fC = (val >> (bits - 1)) & 1; val = (val << 1) | cpu->fC;}
-                    else if (sub == 1) { cpu->fC = val & 1; val = (val >> 1) | (cpu->fC << (bits - 1));}
-                    else if (sub == 4) { cpu->fC = (val >> (bits - 1)) & 1; val <<= 1;}
-                    else if (sub == 5) { cpu->fC = val & 1; val >>= 1;}
-                    else if (sub == 7) { cpu->fC = val & 1; val = is16 ? ((short)val >> 1) : ((char)val >> 1);}
+                    if (sub == 0) {cpu->fC = (val >> (bits - 1)) & 1; val = (val << 1) | cpu->fC;}
+                    else if (sub == 1) {cpu->fC = val & 1; val = (val >> 1) | (cpu->fC << (bits - 1));}
+                    else if (sub == 4) {cpu->fC = (val >> (bits - 1)) & 1; val <<= 1;}
+                    else if (sub == 5) {cpu->fC = val & 1; val >>= 1;}
+                    else if (sub == 7) {cpu->fC = val & 1; val = is16 ? ((short)val >> 1) : ((char)val >> 1);}
                     val &= (is16 ? 0xFFFF : 0xFF);
                 }
                 if (is16) *(WORD*)pRM = (WORD)val; else *(BYTE*)pRM = (BYTE)val;
             }
-
             else if (op >= 0xE0 && op <= 0xE3) {
                 char off = (char)Fetch8(cpu); BOOL do_jmp = FALSE;
                 if (op != 0xE3) cpu->cx--;
@@ -194,12 +226,10 @@ void RunCPU(CPU* cpu) {
                 else if (op == 0xE3) do_jmp = (cpu->cx == 0);
                 if (do_jmp) cpu->ip += off;
             }
-
             else if (op == 0xE8) { WORD off = Fetch16(cpu); Push(cpu, cpu->ip); cpu->ip += off;}
             else if (op == 0xEB) cpu->ip += (char)Fetch8(cpu);
             else if (op == 0xE9) cpu->ip += Fetch16(cpu);
             else if (op == 0xC3) cpu->ip = Pop(cpu);
-
             else if (op == 0xF6 || op == 0xF7) {
                 BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
                 int sub = (modrm >> 3) & 7; DWORD v = is16 ? *(WORD*)pRM : *(BYTE*)pRM;
@@ -211,20 +241,33 @@ void RunCPU(CPU* cpu) {
                 else if (sub == 7 && v != 0) { if (is16) { int n = (int)((cpu->dx << 16) | cpu->ax); cpu->ax = n / (short)v; cpu->dx = n % (short)v; } else { short n = (short)cpu->ax; cpu->al = n / (char)v; cpu->ah = n % (char)v;}}
                 if (sub < 4) { if (is16) *(WORD*)pRM = (WORD)v; else *(BYTE*)pRM = (BYTE)v;}
             }
-
             else if (op == 0xFE || op == 0xFF) {
                 BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
                 int sub = (modrm >> 3) & 7;
+                DWORD val = is16 ? *(WORD*)pRM : *(BYTE*)pRM;
                 if (sub == 0 || sub == 1) {
-                    DWORD d = is16 ? *(WORD*)pRM : *(BYTE*)pRM;
-                    DWORD res = DoALU(cpu, (sub == 0) ? 0 : 5, d, 1, is16);
+                    DWORD res = DoALU(cpu, (sub == 0) ? 0 : 5, val, 1, is16);
                     if (is16) *(WORD*)pRM = (WORD)res; else *(BYTE*)pRM = (BYTE)res;
                 }
+                else if (sub == 2) {Push(cpu, cpu->ip); cpu->ip = (WORD)val;}
+                else if (sub == 4) {cpu->ip = (WORD)val;}
+                else if (sub == 6) {Push(cpu, (WORD)val);}
             }
-
+            else if (op == 0x9C) {
+                Push(cpu, (cpu->fZ ? 0x40 : 0) | (cpu->fS ? 0x80 : 0) | (cpu->fC ? 1 : 0) | (cpu->fD ? 0x400 : 0));
+            }
+            else if (op == 0x9D) {
+                WORD f = Pop(cpu);
+                cpu->fZ = (f & 0x40) != 0; cpu->fS = (f & 0x80) != 0; cpu->fC = (f & 1) != 0; cpu->fD = (f & 0x400) != 0;
+            }
+            else if (op == 0xF8) cpu->fC = 0;
+            else if (op == 0xF9) cpu->fC = 1;
             else if (op == 0xFC) cpu->fD = 0;
             else if (op == 0xFD) cpu->fD = 1;
-
+            else if (op == 0xC6 || op == 0xC7) {
+                BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
+                if (is16) *(WORD*)pRM = Fetch16(cpu); else *(BYTE*)pRM = Fetch8(cpu);
+            }
             else if (op == 0xCD) {
                 BYTE intNum = Fetch8(cpu);
                 if (intNum == 0x10 && cpu->ah == 0x00 && cpu->al == 0x13) SetupVGA();
