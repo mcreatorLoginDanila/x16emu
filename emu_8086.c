@@ -56,14 +56,20 @@ DWORD DoALU(CPU* cpu, int op, DWORD d, DWORD s, int is16) {
     return res;
 }
 HWND g_hwnd = NULL;
-DWORD vga_pal[16] = { 0x000000,0x0000AA,0x00AA00,0x00AAAA,0xAA0000,0xAA00AA,0xAA5500,0xAAAAAA,0x555555,0x5555FF,0x55FF55,0x55FFFF,0xFF5555,0xFF55FF,0xFFFF55,0xFFFFFF};
+BYTE keys[256] = {0};
+DWORD vga_pal[16] = {0x000000,0x0000AA,0x00AA00,0x00AAAA,0xAA0000,0xAA00AA,0xAA5500,0xAAAAAA,0x555555,0x5555FF,0x55FF55,0x55FFFF,0xFF5555,0xFF55FF,0xFFFF55,0xFFFFFF};
 DWORD render_buf[64000];
-LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {if (m == WM_DESTROY) PostQuitMessage(0); return DefWindowProc(h, m, w, l);}
+LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_DESTROY) PostQuitMessage(0);
+    else if (m == WM_KEYDOWN) keys[w & 0xFF] = 1;
+    else if (m == WM_KEYUP) keys[w & 0xFF] = 0;
+    return DefWindowProc(h, m, w, l);
+}
 void SetupVGA() {
     if (g_hwnd) return;
     WNDCLASSA wc = { 0 }; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandle(NULL); wc.lpszClassName = "EmuVGA";
     RegisterClassA(&wc);
-    g_hwnd = CreateWindowExA(0, "EmuVGA", "DOS Emulator", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 640, 440, NULL, NULL, wc.hInstance, NULL);
+    g_hwnd = CreateWindowExA(0, "EmuVGA", "8086 Emulator", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 640, 440, NULL, NULL, wc.hInstance, NULL);
 }
 void RunCPU(CPU* cpu) {
     cpu->running = TRUE; DWORD tick = GetTickCount();
@@ -72,7 +78,8 @@ void RunCPU(CPU* cpu) {
         for (int k = 0; k < 10000 && cpu->running; k++) {
             BYTE op = Fetch8(cpu);
             BOOL rep = FALSE;
-            if (op == 0xF3) {rep = TRUE; op = Fetch8(cpu);}
+            int rep_type = 0;
+            if (op == 0xF3 || op == 0xF2) {rep = TRUE; rep_type = op; op = Fetch8(cpu);}
             int is16 = op & 1; void* pRM, * pReg;
             if (op < 0x40 && (op & 7) < 6) {
                 int low3 = op & 7; int alu_op = (op >> 3) & 7;
@@ -197,7 +204,10 @@ void RunCPU(CPU* cpu) {
                     DWORD s_v = is16 ? cpu->ax : cpu->al;
                     DoALU(cpu, 7, s_v, d_v, is16);
                     cpu->di += step;
-                    if (rep) {cpu->cx--; if (!cpu->cx) rep = FALSE;}
+                    if (rep) {
+                        cpu->cx--;
+                        if (!cpu->cx || (rep_type == 0xF3 && !cpu->fZ) || (rep_type == 0xF2 && cpu->fZ)) rep = FALSE;
+                    }
                 }
                 while (rep && cpu->cx > 0);
             }
@@ -241,6 +251,26 @@ void RunCPU(CPU* cpu) {
                 else if (sub == 7 && v != 0) { if (is16) { int n = (int)((cpu->dx << 16) | cpu->ax); cpu->ax = n / (short)v; cpu->dx = n % (short)v; } else { short n = (short)cpu->ax; cpu->al = n / (char)v; cpu->ah = n % (char)v;}}
                 if (sub < 4) { if (is16) *(WORD*)pRM = (WORD)v; else *(BYTE*)pRM = (BYTE)v;}
             }
+            else if (op == 0xD4) {
+                BYTE base = Fetch8(cpu);
+                if (base == 0) cpu->running = FALSE;
+                else { cpu->ah = cpu->al / base; cpu->al %= base; cpu->fZ = (cpu->ax == 0); cpu->fS = (cpu->ah & 0x80) != 0; }
+            }
+            else if (op == 0xD5) {
+                BYTE base = Fetch8(cpu);
+                cpu->al = (cpu->ah * base) + cpu->al; cpu->ah = 0;
+                cpu->fZ = (cpu->al == 0); cpu->fS = (cpu->al & 0x80) != 0;
+            }
+            else if (op == 0x37) {
+                if ((cpu->al & 0x0F) > 9 || cpu->fC) { cpu->al += 6; cpu->ah++; cpu->fC = 1; }
+                else cpu->fC = 0;
+                cpu->al &= 0x0F;
+                }
+            else if (op == 0x3F) {
+                    if ((cpu->al & 0x0F) > 9 || cpu->fC) { cpu->al -= 6; cpu->ah--; cpu->fC = 1; }
+                    else cpu->fC = 0;
+                    cpu->al &= 0x0F;
+                    }
             else if (op == 0xFE || op == 0xFF) {
                 BYTE modrm = Fetch8(cpu); DecodeModRM(cpu, modrm, is16, &pRM, &pReg);
                 int sub = (modrm >> 3) & 7;
@@ -273,7 +303,7 @@ void RunCPU(CPU* cpu) {
                 if (intNum == 0x10 && cpu->ah == 0x00 && cpu->al == 0x13) SetupVGA();
                 else if (intNum == 0x15 && cpu->ah == 0x86) {Sleep(cpu->dx); k = 10000;}
                 else if (intNum == 0x16 && cpu->ah == 0x10) {
-                    cpu->ah = (GetAsyncKeyState(cpu->al) & 0x8000) ? 1 : 0;
+                    cpu->ah = keys[cpu->al] ? 1 : 0;
                 }
                 else if (intNum == 0x21) {
                     if (cpu->ah == 0x01) {DWORD r; ReadFile(GetStdHandle(STD_INPUT_HANDLE), &cpu->al, 1, &r, NULL);}
@@ -282,6 +312,8 @@ void RunCPU(CPU* cpu) {
                     else if (cpu->ah == 0x4C) cpu->running = FALSE;
                 }
             }
+            else if (op == 0xF4) {cpu->running = FALSE;}
+            else if (op == 0xCC || op == 0xCE) {}
             else {
                 HANDLE hCons = GetStdHandle(STD_OUTPUT_HANDLE); char err[128];
                 wsprintfA(err, "\nCRASH: Unhandled Opcode %02X at %04X:%04X\n", op, cpu->cs, cpu->ip - 1);
